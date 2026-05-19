@@ -8,7 +8,6 @@ import os
 
 app = FastAPI()
 
-# Variáveis do EasyPanel
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
 
@@ -17,7 +16,6 @@ modelo = IsolationForest(
     random_state=42
 )
 
-# Body recebido via API
 class Consulta(BaseModel):
     org: str
     bucket: str
@@ -47,7 +45,6 @@ async def analisar(req: Consulta):
 
         query = f'''
 from(bucket:"{req.bucket}")
-
 |> range(start:-24h)
 
 |> filter(fn:(r)=>
@@ -69,38 +66,27 @@ from(bucket:"{req.bucket}")
 
         df = query_api.query_data_frame(query)
 
-        # Influx pode retornar lista
         if isinstance(df, list):
             df = pd.concat(df)
 
         if df.empty:
-
             return {
-
                 "erro":"Nenhum dado encontrado"
             }
 
         colunas = df.columns.tolist()
 
         if "temperatura" not in colunas:
-
             return {
-
                 "erro":"Campo temperatura não encontrado",
-
                 "colunas":colunas
             }
 
         if "umidade" not in colunas:
-
             return {
-
                 "erro":"Campo umidade não encontrado",
-
                 "colunas":colunas
             }
-
-        # pega só o necessário
 
         df = df[[
             "_time",
@@ -109,7 +95,6 @@ from(bucket:"{req.bucket}")
         ]]
 
         df.columns = [
-
             "timestamp",
             "temperatura",
             "umidade"
@@ -118,18 +103,17 @@ from(bucket:"{req.bucket}")
         df = df.dropna()
 
         if len(df) < 10:
-
             return {
-
                 "erro":"Poucos dados",
-
-                "quantidade":
-                len(df)
+                "quantidade":len(df)
             }
 
-        # ======================
-        # Isolation Forest
-        # ======================
+        # remove timezone
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"]
+        ).dt.tz_localize(None)
+
+        # -------- ANOMALIA --------
 
         X = df[[
             "temperatura",
@@ -142,9 +126,7 @@ from(bucket:"{req.bucket}")
 
         anomalia = pred[-1] == -1
 
-        # ======================
-        # Prophet
-        # ======================
+        # -------- PROPHET --------
 
         p = df[[
             "timestamp",
@@ -176,20 +158,18 @@ from(bucket:"{req.bucket}")
             2
         )
 
-        risco = "baixo"
+        risco="baixo"
 
         if temperatura_futura > 30:
-            risco = "medio"
+            risco="medio"
 
         if temperatura_futura > 35:
-            risco = "alto"
+            risco="alto"
 
         return {
 
             "org":req.org,
-
             "bucket":req.bucket,
-
             "device":req.device,
 
             "anomalia":
@@ -216,12 +196,10 @@ from(bucket:"{req.bucket}")
 
             "risco":
             risco
-
         }
 
     except Exception as e:
 
         return {
-
             "erro":str(e)
         }
