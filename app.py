@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from pydantic import BaseModel
 from sklearn.ensemble import IsolationForest
 from prophet import Prophet
 from influxdb_client import InfluxDBClient
@@ -7,114 +8,179 @@ import os
 
 app = FastAPI()
 
+# Configuração global
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
-INFLUX_ORG = os.getenv("INFLUX_ORG")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET")
-
-cliente = InfluxDBClient(
-    url=INFLUX_URL,
-    token=INFLUX_TOKEN,
-    org=INFLUX_ORG
-)
-
-query_api = cliente.query_api()
 
 modelo = IsolationForest(
     contamination=0.02,
     random_state=42
 )
 
+# Modelo do body recebido
+class Consulta(BaseModel):
+    org: str
+    bucket: str
+
 @app.get("/")
 async def status():
-    return {"status":"ML online"}
 
-@app.get("/analisar")
-async def analisar():
+    return {
+        "status":"ML online"
+    }
 
-    query=f'''
-from(bucket: "{INFLUX_BUCKET}")
+
+@app.post("/analisar")
+async def analisar(req: Consulta):
+
+    try:
+
+        cliente = InfluxDBClient(
+            url=INFLUX_URL,
+            token=INFLUX_TOKEN,
+            org=req.org
+        )
+
+        query_api = cliente.query_api()
+
+        query = f'''
+from(bucket: "{req.bucket}")
 |> range(start: -24h)
-|> filter(fn: (r) =>
-    r["_field"] == "temperatura"
+
+|> filter(fn:(r)=>
+    r["_field"]=="temperatura"
     or
-    r["_field"] == "umidade"
+    r["_field"]=="umidade"
 )
+
 |> pivot(
     rowKey:["_time"],
     columnKey:["_field"],
     valueColumn:"_value"
 )
-'''
 
-    df=query_api.query_data_frame(query)
-
-    if len(df)<10:
-        return {
-            "erro":"Poucos dados"
-        }
-
-    df=df[[
+|> keep(
+    columns:[
         "_time",
         "temperatura",
         "umidade"
-    ]]
-
-    df.columns=[
-        "timestamp",
-        "temperatura",
-        "umidade"
     ]
+)
+'''
 
-    X=df[[
-        "temperatura",
-        "umidade"
-    ]]
+        df = query_api.query_data_frame(query)
 
-    modelo.fit(X)
+        if len(df) < 10:
 
-    pred=modelo.predict(X)
+            return {
 
-    anomalia=pred[-1]==-1
+                "erro":"Poucos dados",
 
-    p=df[[
-        "timestamp",
-        "temperatura"
-    ]]
+                "quantidade":
+                len(df)
+            }
 
-    p.columns=["ds","y"]
+        df.columns = [
 
-    m=Prophet()
+            "timestamp",
+            "temperatura",
+            "umidade"
+        ]
 
-    m.fit(p)
+        # remove linhas inválidas
 
-    futuro=m.make_future_dataframe(
-        periods=12,
-        freq="5min"
-    )
+        df = df.dropna()
 
-    previsao=m.predict(futuro)
+        # ---------- IA ANOMALIA ----------
 
-    temp_futura=round(
-        float(
-            previsao.iloc[-1]["yhat"]
-        ),2
-    )
+        X = df[[
+            "temperatura",
+            "umidade"
+        ]]
 
-    return {
+        modelo.fit(X)
 
-        "anomalia":bool(anomalia),
+        pred = modelo.predict(X)
 
-        "temperatura_atual":
-        float(
-            df.iloc[-1]["temperatura"]
-        ),
+        anomalia = pred[-1] == -1
 
-        "umidade_atual":
-        float(
-            df.iloc[-1]["umidade"]
-        ),
+        # ---------- PROPHET ----------
 
-        "previsao_1h":
-        temp_futura
-    }
+        p = df[[
+            "timestamp",
+            "temperatura"
+        ]]
+
+        p.columns = [
+            "ds",
+            "y"
+        ]
+
+        prophet = Prophet()
+
+        prophet.fit(p)
+
+        futuro = prophet.make_future_dataframe(
+            periods=12,
+            freq="5min"
+        )
+
+        previsao = prophet.predict(
+            futuro
+        )
+
+        temperatura_futura = round(
+            float(
+                previsao.iloc[-1]["yhat"]
+            ),2
+        )
+
+        risco="baixo"
+
+        if temperatura_futura > 30:
+
+            risco="medio"
+
+        if temperatura_futura > 35:
+
+            risco="alto"
+
+        return {
+
+            "cliente_org":
+            req.org,
+
+            "bucket":
+            req.bucket,
+
+            "anomalia":
+            bool(anomalia),
+
+            "temperatura_atual":
+            round(
+                float(
+                    df.iloc[-1]["temperatura"]
+                ),2
+            ),
+
+            "umidade_atual":
+            round(
+                float(
+                    df.iloc[-1]["umidade"]
+                ),2
+            ),
+
+            "previsao_1h":
+            temperatura_futura,
+
+            "risco":
+            risco
+
+        }
+
+    except Exception as e:
+
+        return {
+
+            "erro":str(e)
+        }
