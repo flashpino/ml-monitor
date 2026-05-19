@@ -8,6 +8,7 @@ import os
 
 app = FastAPI()
 
+# Variáveis do EasyPanel
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
 
@@ -16,29 +17,35 @@ modelo = IsolationForest(
     random_state=42
 )
 
+# Body recebido via API
 class Consulta(BaseModel):
-    org:str
-    bucket:str
-    device:str
+    org: str
+    bucket: str
+    device: str
+
 
 @app.get("/")
 async def status():
-    return {"status":"ML online"}
+
+    return {
+        "status":"ML online"
+    }
+
 
 @app.post("/analisar")
 async def analisar(req: Consulta):
 
     try:
 
-        cliente=InfluxDBClient(
+        cliente = InfluxDBClient(
             url=INFLUX_URL,
             token=INFLUX_TOKEN,
             org=req.org
         )
 
-        query_api=cliente.query_api()
+        query_api = cliente.query_api()
 
-        query=f'''
+        query = f'''
 from(bucket:"{req.bucket}")
 
 |> range(start:-24h)
@@ -58,89 +65,132 @@ from(bucket:"{req.bucket}")
     columnKey:["_field"],
     valueColumn:"_value"
 )
-
-|> keep(
-    columns:[
-        "_time",
-        "temperatura",
-        "umidade"
-    ]
-)
 '''
 
-        df=query_api.query_data_frame(query)
+        df = query_api.query_data_frame(query)
 
-        if len(df)<10:
+        # Influx pode retornar lista
+        if isinstance(df, list):
+            df = pd.concat(df)
 
-            return{
-                "erro":"Poucos dados",
-                "quantidade":len(df)
+        if df.empty:
+
+            return {
+
+                "erro":"Nenhum dado encontrado"
             }
 
+        colunas = df.columns.tolist()
 
-df = df[[
-    "_time",
-    "temperatura",
-    "umidade"
-]]
+        if "temperatura" not in colunas:
 
-df.columns = [
-    "timestamp",
-    "temperatura",
-    "umidade"
-]
+            return {
 
-df = df.dropna()
+                "erro":"Campo temperatura não encontrado",
 
-        X=df[[
+                "colunas":colunas
+            }
+
+        if "umidade" not in colunas:
+
+            return {
+
+                "erro":"Campo umidade não encontrado",
+
+                "colunas":colunas
+            }
+
+        # pega só o necessário
+
+        df = df[[
+            "_time",
+            "temperatura",
+            "umidade"
+        ]]
+
+        df.columns = [
+
+            "timestamp",
+            "temperatura",
+            "umidade"
+        ]
+
+        df = df.dropna()
+
+        if len(df) < 10:
+
+            return {
+
+                "erro":"Poucos dados",
+
+                "quantidade":
+                len(df)
+            }
+
+        # ======================
+        # Isolation Forest
+        # ======================
+
+        X = df[[
             "temperatura",
             "umidade"
         ]]
 
         modelo.fit(X)
 
-        pred=modelo.predict(X)
+        pred = modelo.predict(X)
 
-        anomalia=pred[-1]==-1
+        anomalia = pred[-1] == -1
 
-        p=df[[
+        # ======================
+        # Prophet
+        # ======================
+
+        p = df[[
             "timestamp",
             "temperatura"
         ]]
 
-        p.columns=["ds","y"]
+        p.columns = [
+            "ds",
+            "y"
+        ]
 
-        prophet=Prophet()
+        prophet = Prophet()
 
         prophet.fit(p)
 
-        futuro=prophet.make_future_dataframe(
+        futuro = prophet.make_future_dataframe(
             periods=12,
             freq="5min"
         )
 
-        previsao=prophet.predict(
+        previsao = prophet.predict(
             futuro
         )
 
-        temperatura_futura=round(
+        temperatura_futura = round(
             float(
                 previsao.iloc[-1]["yhat"]
-            ),2
+            ),
+            2
         )
 
-        risco="baixo"
+        risco = "baixo"
 
-        if temperatura_futura>30:
-            risco="medio"
+        if temperatura_futura > 30:
+            risco = "medio"
 
-        if temperatura_futura>35:
-            risco="alto"
+        if temperatura_futura > 35:
+            risco = "alto"
 
-        return{
+        return {
 
-            "device":
-            req.device,
+            "org":req.org,
+
+            "bucket":req.bucket,
+
+            "device":req.device,
 
             "anomalia":
             bool(anomalia),
@@ -149,14 +199,16 @@ df = df.dropna()
             round(
                 float(
                     df.iloc[-1]["temperatura"]
-                ),2
+                ),
+                2
             ),
 
             "umidade_atual":
             round(
                 float(
                     df.iloc[-1]["umidade"]
-                ),2
+                ),
+                2
             ),
 
             "previsao_1h":
@@ -164,10 +216,12 @@ df = df.dropna()
 
             "risco":
             risco
+
         }
 
     except Exception as e:
 
-        return{
+        return {
+
             "erro":str(e)
         }
