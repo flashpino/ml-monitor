@@ -6,3 +6,4 @@ scikit-learn
 pyod
 prophet
 python-multipart
+influxdb-client
