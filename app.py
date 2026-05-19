@@ -8,7 +8,6 @@ import os
 
 app = FastAPI()
 
-# Configuração global
 INFLUX_URL = os.getenv("INFLUX_URL")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
 
@@ -17,36 +16,36 @@ modelo = IsolationForest(
     random_state=42
 )
 
-# Modelo do body recebido
 class Consulta(BaseModel):
-    org: str
-    bucket: str
+    org:str
+    bucket:str
     device:str
 
 @app.get("/")
 async def status():
-
-    return {
-        "status":"ML online"
-    }
-
+    return {"status":"ML online"}
 
 @app.post("/analisar")
 async def analisar(req: Consulta):
 
     try:
 
-        cliente = InfluxDBClient(
+        cliente=InfluxDBClient(
             url=INFLUX_URL,
             token=INFLUX_TOKEN,
             org=req.org
         )
 
-        query_api = cliente.query_api()
+        query_api=cliente.query_api()
 
-        query = f'''
-from(bucket: "{req.bucket}")
-|> range(start: -24h)
+        query=f'''
+from(bucket:"{req.bucket}")
+
+|> range(start:-24h)
+
+|> filter(fn:(r)=>
+    r["device_id"]=="{req.device}"
+)
 
 |> filter(fn:(r)=>
     r["_field"]=="temperatura"
@@ -69,68 +68,55 @@ from(bucket: "{req.bucket}")
 )
 '''
 
-        df = query_api.query_data_frame(query)
+        df=query_api.query_data_frame(query)
 
-        if len(df) < 10:
+        if len(df)<10:
 
-            return {
-
+            return{
                 "erro":"Poucos dados",
-
-                "quantidade":
-                len(df)
+                "quantidade":len(df)
             }
 
-        df.columns = [
-
+        df.columns=[
             "timestamp",
             "temperatura",
             "umidade"
         ]
 
-        # remove linhas inválidas
+        df=df.dropna()
 
-        df = df.dropna()
-
-        # ---------- IA ANOMALIA ----------
-
-        X = df[[
+        X=df[[
             "temperatura",
             "umidade"
         ]]
 
         modelo.fit(X)
 
-        pred = modelo.predict(X)
+        pred=modelo.predict(X)
 
-        anomalia = pred[-1] == -1
+        anomalia=pred[-1]==-1
 
-        # ---------- PROPHET ----------
-
-        p = df[[
+        p=df[[
             "timestamp",
             "temperatura"
         ]]
 
-        p.columns = [
-            "ds",
-            "y"
-        ]
+        p.columns=["ds","y"]
 
-        prophet = Prophet()
+        prophet=Prophet()
 
         prophet.fit(p)
 
-        futuro = prophet.make_future_dataframe(
+        futuro=prophet.make_future_dataframe(
             periods=12,
             freq="5min"
         )
 
-        previsao = prophet.predict(
+        previsao=prophet.predict(
             futuro
         )
 
-        temperatura_futura = round(
+        temperatura_futura=round(
             float(
                 previsao.iloc[-1]["yhat"]
             ),2
@@ -138,21 +124,16 @@ from(bucket: "{req.bucket}")
 
         risco="baixo"
 
-        if temperatura_futura > 30:
-
+        if temperatura_futura>30:
             risco="medio"
 
-        if temperatura_futura > 35:
-
+        if temperatura_futura>35:
             risco="alto"
 
-        return {
+        return{
 
-            "cliente_org":
-            req.org,
-
-            "bucket":
-            req.bucket,
+            "device":
+            req.device,
 
             "anomalia":
             bool(anomalia),
@@ -176,12 +157,10 @@ from(bucket: "{req.bucket}")
 
             "risco":
             risco
-
         }
 
     except Exception as e:
 
-        return {
-
+        return{
             "erro":str(e)
         }
