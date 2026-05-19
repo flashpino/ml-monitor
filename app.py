@@ -140,14 +140,24 @@ from(bucket:"{bucket}")
     return df
  
 # ── treino de um device ───────────────────────────────────────────────────────
-def treinar_device(org: str, bucket: str, device: str) -> dict:
-    log.info("Treinando: %s / %s / %s", org, bucket, device)
- 
+# limites razoáveis para temperatura e umidade
+TEMP_MIN = float(os.getenv("TEMP_MIN", "15"))
+TEMP_MAX = float(os.getenv("TEMP_MAX", "60"))
+UMID_MIN = float(os.getenv("UMID_MIN", "0"))
+UMID_MAX = float(os.getenv("UMID_MAX", "100"))
+def treinar_device(org, bucket, device):
     df = query_dados(org, bucket, device, range_str=TRAINING_RANGE)
- 
-    if df.empty:
-        return {"status": "sem_dados", "org": org, "bucket": bucket, "device": device}
- 
+
+    # remove leituras fisicamente impossíveis
+    antes = len(df)
+    df = df[
+        df["temperatura"].between(TEMP_MIN, TEMP_MAX) &
+        df["umidade"].between(UMID_MIN, UMID_MAX)
+    ]
+    descartados = antes - len(df)
+    if descartados > 0:
+        log.warning("Descartados %d registros inválidos em %s/%s/%s", descartados, org, bucket, device)
+
     if len(df) < 100:
         return {
             "status": "dados_insuficientes",
