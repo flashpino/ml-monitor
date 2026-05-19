@@ -6,11 +6,12 @@ from influxdb_client import InfluxDBClient
 import pandas as pd
 import joblib
 import os
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
  
-# ── logging ──────────────────────────────────────────────────────────────────
+# ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
  
@@ -18,15 +19,15 @@ log = logging.getLogger(__name__)
 app = FastAPI(title="CPD ML Service")
  
 # ── config ────────────────────────────────────────────────────────────────────
-INFLUX_URL   = os.getenv("INFLUX_URL")
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
+INFLUX_URL      = os.getenv("INFLUX_URL")
+INFLUX_TOKEN    = os.getenv("INFLUX_TOKEN")
+TRAINING_RANGE  = os.getenv("TRAINING_RANGE", "-90d")
  
-MODEL_DIR         = Path(os.getenv("MODEL_DIR", "/app/models"))
-MODEL_PATH        = MODEL_DIR / "isolation_forest.pkl"
-MODEL_META_PATH   = MODEL_DIR / "isolation_forest_meta.json"
-PROPHET_PATH      = MODEL_DIR / "prophet.pkl"
- 
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+ 
+# buckets internos do influx — ignorar no discovery
+BUCKETS_IGNORADOS = {"_monitoring", "_tasks", "monitoring"}
  
 # ── schemas ───────────────────────────────────────────────────────────────────
 class Consulta(BaseModel):
@@ -34,21 +35,76 @@ class Consulta(BaseModel):
     bucket: str
     device: str
  
-# ── helpers ───────────────────────────────────────────────────────────────────
-def get_influx_client(org: str) -> InfluxDBClient:
+# ── helpers de path ───────────────────────────────────────────────────────────
+def model_key(org: str, bucket: str, device: str) -> str:
+    return f"{org}__{bucket}__{device}".replace("/", "_").replace(" ", "_")
+ 
+def isolation_path(org: str, bucket: str, device: str) -> Path:
+    return MODEL_DIR / f"iso__{model_key(org, bucket, device)}.pkl"
+ 
+def prophet_path(org: str, bucket: str, device: str) -> Path:
+    return MODEL_DIR / f"prophet__{model_key(org, bucket, device)}.pkl"
+ 
+def meta_path(org: str, bucket: str, device: str) -> Path:
+    return MODEL_DIR / f"meta__{model_key(org, bucket, device)}.json"
+ 
+def salvar_meta(org: str, bucket: str, device: str, dados: dict):
+    meta_path(org, bucket, device).write_text(json.dumps(dados, indent=2))
+ 
+def carregar_meta(org: str, bucket: str, device: str) -> dict:
+    p = meta_path(org, bucket, device)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text())
+ 
+# ── helpers influx ────────────────────────────────────────────────────────────
+def get_client(org: str) -> InfluxDBClient:
     if not INFLUX_URL or not INFLUX_TOKEN:
-        raise HTTPException(
-            status_code=500,
-            detail="Variáveis INFLUX_URL e INFLUX_TOKEN não configuradas"
-        )
+        raise HTTPException(500, "INFLUX_URL e INFLUX_TOKEN não configurados.")
     return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=org)
  
  
-def query_influx(org: str, bucket: str, device: str, range_str: str) -> pd.DataFrame:
-    """Consulta temperatura e umidade do InfluxDB para um range qualquer."""
-    cliente   = get_influx_client(org)
-    query_api = cliente.query_api()
+def listar_orgs() -> list[str]:
+    client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN)
+    orgs_api = client.organizations_api()
+    return [o.name for o in orgs_api.find_organizations()]
  
+ 
+def listar_buckets(org: str) -> list[str]:
+    client = get_client(org)
+    buckets_api = client.buckets_api()
+    buckets = buckets_api.find_buckets().buckets or []
+    return [b.name for b in buckets if b.name not in BUCKETS_IGNORADOS]
+ 
+ 
+def listar_devices(org: str, bucket: str) -> list[str]:
+    client    = get_client(org)
+    query_api = client.query_api()
+    query = f'''
+import "influxdata/influxdb/schema"
+schema.tagValues(
+    bucket: "{bucket}",
+    tag: "device_id",
+    start: {TRAINING_RANGE}
+)
+'''
+    try:
+        tables  = query_api.query(query)
+        devices = []
+        for table in tables:
+            for record in table.records:
+                v = record.get_value()
+                if v:
+                    devices.append(v)
+        return devices
+    except Exception as e:
+        log.warning("Erro ao listar devices em %s/%s: %s", org, bucket, e)
+        return []
+ 
+ 
+def query_dados(org: str, bucket: str, device: str, range_str: str) -> pd.DataFrame:
+    client    = get_client(org)
+    query_api = client.query_api()
     query = f'''
 from(bucket:"{bucket}")
 |> range(start:{range_str})
@@ -72,104 +128,51 @@ from(bucket:"{bucket}")
     if df.empty:
         return pd.DataFrame()
  
-    colunas_necessarias = {"temperatura", "umidade", "_time"}
-    faltando = colunas_necessarias - set(df.columns)
+    faltando = {"temperatura", "umidade", "_time"} - set(df.columns)
     if faltando:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Campos ausentes no InfluxDB: {faltando}"
-        )
+        log.warning("Campos ausentes em %s/%s/%s: %s", org, bucket, device, faltando)
+        return pd.DataFrame()
  
     df = df[["_time", "temperatura", "umidade"]].copy()
     df.columns = ["timestamp", "temperatura", "umidade"]
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
     df = df.dropna().reset_index(drop=True)
- 
     return df
  
+# ── treino de um device ───────────────────────────────────────────────────────
+def treinar_device(org: str, bucket: str, device: str) -> dict:
+    log.info("Treinando: %s / %s / %s", org, bucket, device)
  
-def modelo_existe() -> bool:
-    return MODEL_PATH.exists() and PROPHET_PATH.exists()
- 
- 
-def carregar_isolation() -> IsolationForest:
-    if not MODEL_PATH.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Modelo IsolationForest não encontrado. Chame /treinar primeiro."
-        )
-    return joblib.load(MODEL_PATH)
- 
- 
-def carregar_prophet() -> Prophet:
-    if not PROPHET_PATH.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Modelo Prophet não encontrado. Chame /treinar primeiro."
-        )
-    return joblib.load(PROPHET_PATH)
- 
- 
-def calcular_risco(temperatura: float) -> str:
-    if temperatura > 35:
-        return "alto"
-    if temperatura > 30:
-        return "medio"
-    return "baixo"
- 
- 
-# ── rotas ─────────────────────────────────────────────────────────────────────
- 
-@app.get("/")
-async def status():
-    return {
-        "status": "ML online",
-        "modelo_treinado": modelo_existe(),
-        "model_dir": str(MODEL_DIR),
-    }
- 
- 
-@app.post("/treinar")
-async def treinar(req: Consulta):
-    """
-    Treina IsolationForest + Prophet com 30 dias de histórico.
-    Chame este endpoint 1x por semana (ex: cron no n8n às 02h de domingo).
-    """
-    log.info("Iniciando treinamento — range: -90d")
- 
-    df = query_influx(req.org, req.bucket, req.device, range_str=os.getenv("TRAINING_RANGE", "-90d"))
-
+    df = query_dados(org, bucket, device, range_str=TRAINING_RANGE)
  
     if df.empty:
-        raise HTTPException(status_code=422, detail="Nenhum dado encontrado nos últimos 90 dias.")
+        return {"status": "sem_dados", "org": org, "bucket": bucket, "device": device}
  
     if len(df) < 100:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Dados insuficientes para treino: {len(df)} registros (mínimo: 50)."
-        )
+        return {
+            "status": "dados_insuficientes",
+            "org": org, "bucket": bucket, "device": device,
+            "amostras": len(df),
+        }
  
-    # ── IsolationForest ───────────────────────────────────────────────────────
+    # IsolationForest
     iso = IsolationForest(contamination=0.02, random_state=42)
     iso.fit(df[["temperatura", "umidade"]])
-    joblib.dump(iso, MODEL_PATH)
-    log.info("IsolationForest salvo em %s", MODEL_PATH)
+    joblib.dump(iso, isolation_path(org, bucket, device))
  
-    # ── Prophet ───────────────────────────────────────────────────────────────
+    # Prophet
     p = df[["timestamp", "temperatura"]].copy()
     p.columns = ["ds", "y"]
- 
     prophet = Prophet(
         daily_seasonality=True,
         weekly_seasonality=True,
-        yearly_seasonality=False,   # 90d não é suficiente pra anual
+        yearly_seasonality=False,
         interval_width=0.80,
     )
     prophet.fit(p)
-    joblib.dump(prophet, PROPHET_PATH)
-    log.info("Prophet salvo em %s", PROPHET_PATH)
+    joblib.dump(prophet, prophet_path(org, bucket, device))
  
-    # ── metadados ─────────────────────────────────────────────────────────────
+    # Meta
     meta = {
         "treinado_em": datetime.utcnow().isoformat(),
         "amostras": len(df),
@@ -177,89 +180,189 @@ async def treinar(req: Consulta):
         "temperatura_max": round(float(df["temperatura"].max()), 2),
         "umidade_min": round(float(df["umidade"].min()), 2),
         "umidade_max": round(float(df["umidade"].max()), 2),
+        "training_range": TRAINING_RANGE,
+    }
+    salvar_meta(org, bucket, device, meta)
+ 
+    log.info("Concluído: %s/%s/%s — %d amostras", org, bucket, device, len(df))
+    return {"status": "ok", "org": org, "bucket": bucket, "device": device, **meta}
+ 
+# ── risco ─────────────────────────────────────────────────────────────────────
+def calcular_risco(temperatura: float) -> str:
+    if temperatura > 35:
+        return "alto"
+    if temperatura > 30:
+        return "medio"
+    return "baixo"
+ 
+# ── rotas ─────────────────────────────────────────────────────────────────────
+ 
+@app.get("/")
+async def status():
+    modelos = list(MODEL_DIR.glob("iso__*.pkl"))
+    return {
+        "status": "ML online",
+        "devices_treinados": len(modelos),
+        "training_range": TRAINING_RANGE,
     }
  
-    import json
-    MODEL_META_PATH.write_text(json.dumps(meta, indent=2))
+ 
+@app.post("/treinar-tudo")
+async def treinar_tudo():
+    """
+    Descobre automaticamente todas as orgs, buckets e devices
+    e treina um modelo separado pra cada um.
+    Chame 1x por semana via cron no n8n.
+    """
+    log.info("Iniciando treino automático completo")
+ 
+    orgs       = listar_orgs()
+    resultados = []
+    erros      = []
+ 
+    for org in orgs:
+        buckets = listar_buckets(org)
+        log.info("Org: %s | Buckets: %s", org, buckets)
+ 
+        for bucket in buckets:
+            devices = listar_devices(org, bucket)
+            log.info("Bucket: %s/%s | Devices: %s", org, bucket, devices)
+ 
+            for device in devices:
+                try:
+                    resultado = treinar_device(org, bucket, device)
+                    if resultado["status"] == "ok":
+                        resultados.append(resultado)
+                    else:
+                        erros.append(resultado)
+                except Exception as e:
+                    log.error("Erro: %s/%s/%s — %s", org, bucket, device, e)
+                    erros.append({
+                        "status": "erro",
+                        "org": org, "bucket": bucket, "device": device,
+                        "detalhe": str(e),
+                    })
  
     return {
-        "status": "treinamento concluído",
-        **meta,
+        "treinados_com_sucesso": len(resultados),
+        "com_problema":          len(erros),
+        "detalhes":              resultados,
+        "problemas":             erros,
     }
+ 
+ 
+@app.post("/treinar")
+async def treinar(req: Consulta):
+    """
+    Treina um device específico manualmente.
+    Útil pra forçar retreino de um sensor sem esperar o cron semanal.
+    """
+    resultado = treinar_device(req.org, req.bucket, req.device)
+ 
+    if resultado["status"] == "sem_dados":
+        raise HTTPException(422, "Nenhum dado encontrado no período.")
+    if resultado["status"] == "dados_insuficientes":
+        raise HTTPException(422, f"Dados insuficientes: {resultado['amostras']} amostras (mínimo: 100).")
+ 
+    return resultado
  
  
 @app.post("/analisar")
 async def analisar(req: Consulta):
     """
-    Analisa os últimos 15 minutos usando modelos já treinados.
-    Chame a cada 5 minutos no n8n — rápido e leve.
+    Analisa os últimos 15 minutos usando o modelo treinado para este device.
+    Chame a cada 5 minutos no n8n.
     """
-    # ── carrega modelos do disco ───────────────────────────────────────────────
-    iso    = carregar_isolation()
-    prophet = carregar_prophet()
+    iso_p = isolation_path(req.org, req.bucket, req.device)
+    pro_p = prophet_path(req.org, req.bucket, req.device)
  
-    # ── busca apenas dados recentes ───────────────────────────────────────────
-    df = query_influx(req.org, req.bucket, req.device, range_str="-15m")
- 
-    if df.empty:
-        raise HTTPException(status_code=422, detail="Nenhum dado nos últimos 15 minutos.")
- 
-    if len(df) < 2:
+    if not iso_p.exists() or not pro_p.exists():
         raise HTTPException(
-            status_code=422,
-            detail=f"Poucos pontos para análise: {len(df)}. Verifique o intervalo de coleta."
+            404,
+            f"Modelo não encontrado para {req.org}/{req.bucket}/{req.device}. "
+            "Chame /treinar-tudo ou /treinar primeiro."
         )
  
-    # ── anomalia ──────────────────────────────────────────────────────────────
-    X = df[["temperatura", "umidade"]]
+    iso     = joblib.load(iso_p)
+    prophet = joblib.load(pro_p)
+ 
+    df = query_dados(req.org, req.bucket, req.device, range_str="-15m")
+ 
+    if df.empty:
+        raise HTTPException(422, "Nenhum dado nos últimos 15 minutos.")
+    if len(df) < 2:
+        raise HTTPException(422, f"Poucos pontos: {len(df)}. Verifique o intervalo de coleta.")
+ 
+    # Anomalia
+    X           = df[["temperatura", "umidade"]]
     pred        = iso.predict(X)
-    score       = iso.decision_function(X)          # quanto mais negativo, mais anômalo
+    score       = iso.decision_function(X)
     anomalia    = bool(pred[-1] == -1)
     score_atual = round(float(score[-1]), 4)
  
-    # ── previsão 1h ───────────────────────────────────────────────────────────
-    p = df[["timestamp", "temperatura"]].copy()
-    p.columns = ["ds", "y"]
- 
-    # Prophet precisa de pelo menos alguns pontos — se tiver poucos,
-    # usamos o modelo global já treinado e apenas predizemos o futuro
+    # Previsão 1h
     futuro   = prophet.make_future_dataframe(periods=12, freq="5min")
     previsao = prophet.predict(futuro)
  
-    ultima_previsao    = previsao.iloc[-1]
-    temperatura_futura = round(float(ultima_previsao["yhat"]), 2)
-    temp_futuro_min    = round(float(ultima_previsao["yhat_lower"]), 2)
-    temp_futuro_max    = round(float(ultima_previsao["yhat_upper"]), 2)
+    ultima          = previsao.iloc[-1]
+    temp_futura     = round(float(ultima["yhat"]), 2)
+    temp_futuro_min = round(float(ultima["yhat_lower"]), 2)
+    temp_futuro_max = round(float(ultima["yhat_upper"]), 2)
  
     ultimo = df.iloc[-1]
+    meta   = carregar_meta(req.org, req.bucket, req.device)
  
     return {
-        "org":    req.org,
-        "bucket": req.bucket,
-        "device": req.device,
-        # leitura atual
+        "org":               req.org,
+        "bucket":            req.bucket,
+        "device":            req.device,
+        "timestamp_leitura": ultimo["timestamp"].isoformat(),
         "temperatura_atual": round(float(ultimo["temperatura"]), 2),
         "umidade_atual":     round(float(ultimo["umidade"]), 2),
-        "timestamp_leitura": ultimo["timestamp"].isoformat(),
-        # anomalia
-        "anomalia":     anomalia,
-        "anomalia_score": score_atual,   # referência: < 0 suspeito, << 0 anômalo
-        # previsão +1h
+        "anomalia":          anomalia,
+        "anomalia_score":    score_atual,
         "previsao_1h": {
-            "temperatura":  temperatura_futura,
+            "temperatura":   temp_futura,
             "intervalo_min": temp_futuro_min,
             "intervalo_max": temp_futuro_max,
         },
-        "risco": calcular_risco(temperatura_futura),
+        "risco":              calcular_risco(temp_futura),
+        "modelo_treinado_em": meta.get("treinado_em", "desconhecido"),
     }
  
  
-@app.get("/modelo/info")
-async def modelo_info():
-    """Retorna metadados do último treinamento."""
-    if not MODEL_META_PATH.exists():
-        raise HTTPException(status_code=404, detail="Nenhum treinamento registrado ainda.")
+@app.get("/modelos")
+async def listar_modelos():
+    """Lista todos os devices que já têm modelo treinado."""
+    modelos = []
+    for iso_file in sorted(MODEL_DIR.glob("iso__*.pkl")):
+        chave  = iso_file.stem.replace("iso__", "")
+        partes = chave.split("__")
+        if len(partes) != 3:
+            continue
+        org, bucket, device = partes
+        meta = carregar_meta(org, bucket, device)
+        modelos.append({
+            "org": org, "bucket": bucket, "device": device,
+            **meta,
+        })
+    return {"total": len(modelos), "modelos": modelos}
  
-    import json
-    meta = json.loads(MODEL_META_PATH.read_text())
-    return meta
+ 
+@app.delete("/modelos/{org}/{bucket}/{device}")
+async def deletar_modelo(org: str, bucket: str, device: str):
+    """Remove o modelo de um device específico."""
+    arquivos = [
+        isolation_path(org, bucket, device),
+        prophet_path(org, bucket, device),
+        meta_path(org, bucket, device),
+    ]
+    deletados = [f.name for f in arquivos if f.exists()]
+    for f in arquivos:
+        if f.exists():
+            f.unlink()
+ 
+    if not deletados:
+        raise HTTPException(404, "Nenhum modelo encontrado para este device.")
+ 
+    return {"deletados": deletados}
