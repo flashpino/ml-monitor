@@ -21,6 +21,7 @@ modelo = IsolationForest(
 class Consulta(BaseModel):
     org: str
     bucket: str
+    device:str
 
 @app.get("/")
 async def status():
