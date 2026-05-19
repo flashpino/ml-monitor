@@ -142,9 +142,9 @@ from(bucket:"{bucket}")
 # ── treino de um device ───────────────────────────────────────────────────────
 # limites razoáveis para temperatura e umidade
 TEMP_MIN = float(os.getenv("TEMP_MIN", "15"))
-TEMP_MAX = float(os.getenv("TEMP_MAX", "60"))
-UMID_MIN = float(os.getenv("UMID_MIN", "0"))
-UMID_MAX = float(os.getenv("UMID_MAX", "100"))
+TEMP_MAX = float(os.getenv("TEMP_MAX", "35"))
+UMID_MIN = float(os.getenv("UMID_MIN", "20"))
+UMID_MAX = float(os.getenv("UMID_MAX", "80"))
 def treinar_device(org, bucket, device):
     df = query_dados(org, bucket, device, range_str=TRAINING_RANGE)
 
