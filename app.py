@@ -77,13 +77,20 @@ from(bucket:"{req.bucket}")
                 "quantidade":len(df)
             }
 
-        df.columns=[
-            "timestamp",
-            "temperatura",
-            "umidade"
-        ]
 
-        df=df.dropna()
+df = df[[
+    "_time",
+    "temperatura",
+    "umidade"
+]]
+
+df.columns = [
+    "timestamp",
+    "temperatura",
+    "umidade"
+]
+
+df = df.dropna()
 
         X=df[[
             "temperatura",
