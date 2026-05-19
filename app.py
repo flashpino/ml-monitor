@@ -10,73 +10,79 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
- 
+from zoneinfo import ZoneInfo
+
 # ── logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
- 
+
 # ── app ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="CPD ML Service")
- 
+
 # ── config ────────────────────────────────────────────────────────────────────
-INFLUX_URL      = os.getenv("INFLUX_URL")
-INFLUX_TOKEN    = os.getenv("INFLUX_TOKEN")
-TRAINING_RANGE  = os.getenv("TRAINING_RANGE", "-90d")
- 
+INFLUX_URL     = os.getenv("INFLUX_URL")
+INFLUX_TOKEN   = os.getenv("INFLUX_TOKEN")
+TRAINING_RANGE = os.getenv("TRAINING_RANGE", "-90d")
+
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
- 
-# buckets internos do influx — ignorar no discovery
+
 BUCKETS_IGNORADOS = {"_monitoring", "_tasks", "monitoring"}
- 
+
+TZ_SP    = ZoneInfo("America/Sao_Paulo")
+TEMP_MIN = float(os.getenv("TEMP_MIN", "15"))
+TEMP_MAX = float(os.getenv("TEMP_MAX", "35"))
+UMID_MIN = float(os.getenv("UMID_MIN", "20"))
+UMID_MAX = float(os.getenv("UMID_MAX", "80"))
+
 # ── schemas ───────────────────────────────────────────────────────────────────
 class Consulta(BaseModel):
     org: str
     bucket: str
     device: str
- 
+
 # ── helpers de path ───────────────────────────────────────────────────────────
 def model_key(org: str, bucket: str, device: str) -> str:
     return f"{org}__{bucket}__{device}".replace("/", "_").replace(" ", "_")
- 
+
 def isolation_path(org: str, bucket: str, device: str) -> Path:
     return MODEL_DIR / f"iso__{model_key(org, bucket, device)}.pkl"
- 
+
 def prophet_path(org: str, bucket: str, device: str) -> Path:
     return MODEL_DIR / f"prophet__{model_key(org, bucket, device)}.pkl"
- 
+
 def meta_path(org: str, bucket: str, device: str) -> Path:
     return MODEL_DIR / f"meta__{model_key(org, bucket, device)}.json"
- 
+
 def salvar_meta(org: str, bucket: str, device: str, dados: dict):
     meta_path(org, bucket, device).write_text(json.dumps(dados, indent=2))
- 
+
 def carregar_meta(org: str, bucket: str, device: str) -> dict:
     p = meta_path(org, bucket, device)
     if not p.exists():
         return {}
     return json.loads(p.read_text())
- 
+
 # ── helpers influx ────────────────────────────────────────────────────────────
 def get_client(org: str) -> InfluxDBClient:
     if not INFLUX_URL or not INFLUX_TOKEN:
         raise HTTPException(500, "INFLUX_URL e INFLUX_TOKEN não configurados.")
     return InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=org)
- 
- 
+
+
 def listar_orgs() -> list[str]:
+    if not INFLUX_URL or not INFLUX_TOKEN:
+        raise HTTPException(500, "INFLUX_URL e INFLUX_TOKEN não configurados.")
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN)
-    orgs_api = client.organizations_api()
-    return [o.name for o in orgs_api.find_organizations()]
- 
- 
+    return [o.name for o in client.organizations_api().find_organizations()]
+
+
 def listar_buckets(org: str) -> list[str]:
     client = get_client(org)
-    buckets_api = client.buckets_api()
-    buckets = buckets_api.find_buckets().buckets or []
+    buckets = client.buckets_api().find_buckets(org=org).buckets or []
     return [b.name for b in buckets if b.name not in BUCKETS_IGNORADOS]
- 
- 
+
+
 def listar_devices(org: str, bucket: str) -> list[str]:
     client    = get_client(org)
     query_api = client.query_api()
@@ -100,8 +106,8 @@ schema.tagValues(
     except Exception as e:
         log.warning("Erro ao listar devices em %s/%s: %s", org, bucket, e)
         return []
- 
- 
+
+
 def query_dados(org: str, bucket: str, device: str, range_str: str) -> pd.DataFrame:
     client    = get_client(org)
     query_api = client.query_api()
@@ -121,42 +127,45 @@ from(bucket:"{bucket}")
 )
 '''
     df = query_api.query_data_frame(query)
- 
+
     if isinstance(df, list):
         df = pd.concat(df, ignore_index=True)
- 
+
     if df.empty:
         return pd.DataFrame()
- 
+
     faltando = {"temperatura", "umidade", "_time"} - set(df.columns)
     if faltando:
         log.warning("Campos ausentes em %s/%s/%s: %s", org, bucket, device, faltando)
         return pd.DataFrame()
- 
+
     df = df[["_time", "temperatura", "umidade"]].copy()
     df.columns = ["timestamp", "temperatura", "umidade"]
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
     df = df.dropna().reset_index(drop=True)
     return df
- 
+
 # ── treino de um device ───────────────────────────────────────────────────────
-# limites razoáveis para temperatura e umidade
-TEMP_MIN = float(os.getenv("TEMP_MIN", "15"))
-TEMP_MAX = float(os.getenv("TEMP_MAX", "35"))
-UMID_MIN = float(os.getenv("UMID_MIN", "20"))
-UMID_MAX = float(os.getenv("UMID_MAX", "80"))
-def treinar_device(org, bucket, device):
+def treinar_device(org: str, bucket: str, device: str) -> dict:
+    log.info("Treinando: %s / %s / %s", org, bucket, device)
+
     df = query_dados(org, bucket, device, range_str=TRAINING_RANGE)
 
-    # remove leituras fisicamente impossíveis
+    if df.empty:
+        return {"status": "sem_dados", "org": org, "bucket": bucket, "device": device}
+
+    # Remove leituras inválidas
     antes = len(df)
     df = df[
         df["temperatura"].between(TEMP_MIN, TEMP_MAX) &
         df["umidade"].between(UMID_MIN, UMID_MAX)
-    ]
+    ].reset_index(drop=True)
     descartados = antes - len(df)
     if descartados > 0:
-        log.warning("Descartados %d registros inválidos em %s/%s/%s", descartados, org, bucket, device)
+        log.warning(
+            "Descartados %d registros inválidos em %s/%s/%s",
+            descartados, org, bucket, device
+        )
 
     if len(df) < 100:
         return {
@@ -164,12 +173,12 @@ def treinar_device(org, bucket, device):
             "org": org, "bucket": bucket, "device": device,
             "amostras": len(df),
         }
- 
+
     # IsolationForest
     iso = IsolationForest(contamination=0.02, random_state=42)
     iso.fit(df[["temperatura", "umidade"]])
     joblib.dump(iso, isolation_path(org, bucket, device))
- 
+
     # Prophet
     p = df[["timestamp", "temperatura"]].copy()
     p.columns = ["ds", "y"]
@@ -181,22 +190,24 @@ def treinar_device(org, bucket, device):
     )
     prophet.fit(p)
     joblib.dump(prophet, prophet_path(org, bucket, device))
- 
-    # Meta
+
+    # Meta — calculado após filtro
     meta = {
-        "treinado_em": datetime.utcnow().isoformat(),
-        "amostras": len(df),
+        "treinado_em":   datetime.now(tz=TZ_SP).isoformat(),
+        "amostras":      len(df),
+        "descartados":   descartados,
         "temperatura_min": round(float(df["temperatura"].min()), 2),
         "temperatura_max": round(float(df["temperatura"].max()), 2),
-        "umidade_min": round(float(df["umidade"].min()), 2),
-        "umidade_max": round(float(df["umidade"].max()), 2),
-        "training_range": TRAINING_RANGE,
+        "umidade_min":     round(float(df["umidade"].min()), 2),
+        "umidade_max":     round(float(df["umidade"].max()), 2),
+        "training_range":  TRAINING_RANGE,
     }
     salvar_meta(org, bucket, device, meta)
- 
-    log.info("Concluído: %s/%s/%s — %d amostras", org, bucket, device, len(df))
+
+    log.info("Concluído: %s/%s/%s — %d amostras (%d descartados)",
+             org, bucket, device, len(df), descartados)
     return {"status": "ok", "org": org, "bucket": bucket, "device": device, **meta}
- 
+
 # ── risco ─────────────────────────────────────────────────────────────────────
 def calcular_risco(temperatura: float) -> str:
     if temperatura > 35:
@@ -204,19 +215,53 @@ def calcular_risco(temperatura: float) -> str:
     if temperatura > 30:
         return "medio"
     return "baixo"
- 
+
 # ── rotas ─────────────────────────────────────────────────────────────────────
- 
+
 @app.get("/")
 async def status():
     modelos = list(MODEL_DIR.glob("iso__*.pkl"))
     return {
-        "status": "ML online",
+        "status":           "ML online",
         "devices_treinados": len(modelos),
-        "training_range": TRAINING_RANGE,
+        "training_range":   TRAINING_RANGE,
     }
- 
- 
+
+
+@app.get("/discovery")
+async def discovery():
+    """Lista todas as orgs, buckets e devices encontrados no InfluxDB."""
+    resultado = {}
+    erros     = []
+
+    try:
+        orgs = listar_orgs()
+    except Exception as e:
+        raise HTTPException(500, f"Erro ao listar orgs: {e}")
+
+    for org in orgs:
+        resultado[org] = {}
+        try:
+            buckets = listar_buckets(org)
+        except Exception as e:
+            erros.append({"org": org, "erro": str(e)})
+            continue
+
+        for bucket in buckets:
+            try:
+                devices = listar_devices(org, bucket)
+                resultado[org][bucket] = devices
+            except Exception as e:
+                erros.append({"org": org, "bucket": bucket, "erro": str(e)})
+                resultado[org][bucket] = []
+
+    return {
+        "orgs_encontradas": len(resultado),
+        "resultado":        resultado,
+        "erros":            erros,
+    }
+
+
 @app.post("/treinar-tudo")
 async def treinar_tudo():
     """
@@ -225,19 +270,19 @@ async def treinar_tudo():
     Chame 1x por semana via cron no n8n.
     """
     log.info("Iniciando treino automático completo")
- 
+
     orgs       = listar_orgs()
     resultados = []
     erros      = []
- 
+
     for org in orgs:
         buckets = listar_buckets(org)
         log.info("Org: %s | Buckets: %s", org, buckets)
- 
+
         for bucket in buckets:
             devices = listar_devices(org, bucket)
             log.info("Bucket: %s/%s | Devices: %s", org, bucket, devices)
- 
+
             for device in devices:
                 try:
                     resultado = treinar_device(org, bucket, device)
@@ -252,15 +297,15 @@ async def treinar_tudo():
                         "org": org, "bucket": bucket, "device": device,
                         "detalhe": str(e),
                     })
- 
+
     return {
         "treinados_com_sucesso": len(resultados),
         "com_problema":          len(erros),
         "detalhes":              resultados,
         "problemas":             erros,
     }
- 
- 
+
+
 @app.post("/treinar")
 async def treinar(req: Consulta):
     """
@@ -268,15 +313,15 @@ async def treinar(req: Consulta):
     Útil pra forçar retreino de um sensor sem esperar o cron semanal.
     """
     resultado = treinar_device(req.org, req.bucket, req.device)
- 
+
     if resultado["status"] == "sem_dados":
         raise HTTPException(422, "Nenhum dado encontrado no período.")
     if resultado["status"] == "dados_insuficientes":
         raise HTTPException(422, f"Dados insuficientes: {resultado['amostras']} amostras (mínimo: 100).")
- 
+
     return resultado
- 
- 
+
+
 @app.post("/analisar")
 async def analisar(req: Consulta):
     """
@@ -285,43 +330,43 @@ async def analisar(req: Consulta):
     """
     iso_p = isolation_path(req.org, req.bucket, req.device)
     pro_p = prophet_path(req.org, req.bucket, req.device)
- 
+
     if not iso_p.exists() or not pro_p.exists():
         raise HTTPException(
             404,
             f"Modelo não encontrado para {req.org}/{req.bucket}/{req.device}. "
             "Chame /treinar-tudo ou /treinar primeiro."
         )
- 
+
     iso     = joblib.load(iso_p)
     prophet = joblib.load(pro_p)
- 
+
     df = query_dados(req.org, req.bucket, req.device, range_str="-15m")
- 
+
     if df.empty:
         raise HTTPException(422, "Nenhum dado nos últimos 15 minutos.")
     if len(df) < 2:
         raise HTTPException(422, f"Poucos pontos: {len(df)}. Verifique o intervalo de coleta.")
- 
+
     # Anomalia
     X           = df[["temperatura", "umidade"]]
     pred        = iso.predict(X)
     score       = iso.decision_function(X)
     anomalia    = bool(pred[-1] == -1)
     score_atual = round(float(score[-1]), 4)
- 
+
     # Previsão 1h
     futuro   = prophet.make_future_dataframe(periods=12, freq="5min")
     previsao = prophet.predict(futuro)
- 
+
     ultima          = previsao.iloc[-1]
     temp_futura     = round(float(ultima["yhat"]), 2)
     temp_futuro_min = round(float(ultima["yhat_lower"]), 2)
     temp_futuro_max = round(float(ultima["yhat_upper"]), 2)
- 
+
     ultimo = df.iloc[-1]
     meta   = carregar_meta(req.org, req.bucket, req.device)
- 
+
     return {
         "org":               req.org,
         "bucket":            req.bucket,
@@ -339,8 +384,8 @@ async def analisar(req: Consulta):
         "risco":              calcular_risco(temp_futura),
         "modelo_treinado_em": meta.get("treinado_em", "desconhecido"),
     }
- 
- 
+
+
 @app.get("/modelos")
 async def listar_modelos():
     """Lista todos os devices que já têm modelo treinado."""
@@ -357,8 +402,8 @@ async def listar_modelos():
             **meta,
         })
     return {"total": len(modelos), "modelos": modelos}
- 
- 
+
+
 @app.delete("/modelos/{org}/{bucket}/{device}")
 async def deletar_modelo(org: str, bucket: str, device: str):
     """Remove o modelo de um device específico."""
@@ -371,8 +416,8 @@ async def deletar_modelo(org: str, bucket: str, device: str):
     for f in arquivos:
         if f.exists():
             f.unlink()
- 
+
     if not deletados:
         raise HTTPException(404, "Nenhum modelo encontrado para este device.")
- 
+
     return {"deletados": deletados}
