@@ -5,23 +5,22 @@ from influxdb_client import InfluxDBClient
 import pandas as pd
 import os
 
-app=FastAPI()
+app = FastAPI()
 
-# Variáveis que vamos configurar no EasyPanel
-INFLUX_URL=os.getenv("INFLUX_URL")
-INFLUX_TOKEN=os.getenv("INFLUX_TOKEN")
-INFLUX_ORG=os.getenv("INFLUX_ORG")
-INFLUX_BUCKET=os.getenv("INFLUX_BUCKET")
+INFLUX_URL = os.getenv("INFLUX_URL")
+INFLUX_TOKEN = os.getenv("INFLUX_TOKEN")
+INFLUX_ORG = os.getenv("INFLUX_ORG")
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET")
 
-cliente=InfluxDBClient(
+cliente = InfluxDBClient(
     url=INFLUX_URL,
     token=INFLUX_TOKEN,
     org=INFLUX_ORG
 )
 
-query_api=cliente.query_api()
+query_api = cliente.query_api()
 
-modelo=IsolationForest(
+modelo = IsolationForest(
     contamination=0.02,
     random_state=42
 )
@@ -31,34 +30,45 @@ async def status():
     return {"status":"ML online"}
 
 @app.get("/analisar")
-
 async def analisar():
 
     query=f'''
-from(bucket:"{INFLUX_BUCKET}")
-|> range(start:-24h)
-|> filter(fn:(r)=>r._field=="temperatura")
+from(bucket: "{INFLUX_BUCKET}")
+|> range(start: -24h)
+|> filter(fn: (r) =>
+    r["_field"] == "temperatura"
+    or
+    r["_field"] == "umidade"
+)
+|> pivot(
+    rowKey:["_time"],
+    columnKey:["_field"],
+    valueColumn:"_value"
+)
 '''
 
-    resultado=query_api.query_data_frame(query)
+    df=query_api.query_data_frame(query)
 
-    if len(resultado)<10:
+    if len(df)<10:
         return {
             "erro":"Poucos dados"
         }
 
-    df=resultado[["_time","_value"]]
+    df=df[[
+        "_time",
+        "temperatura",
+        "umidade"
+    ]]
 
     df.columns=[
         "timestamp",
-        "temperatura"
+        "temperatura",
+        "umidade"
     ]
 
-    df["umidade"]=60
-
     X=df[[
-      "temperatura",
-      "umidade"
+        "temperatura",
+        "umidade"
     ]]
 
     modelo.fit(X)
@@ -68,8 +78,8 @@ from(bucket:"{INFLUX_BUCKET}")
     anomalia=pred[-1]==-1
 
     p=df[[
-      "timestamp",
-      "temperatura"
+        "timestamp",
+        "temperatura"
     ]]
 
     p.columns=["ds","y"]
@@ -79,17 +89,32 @@ from(bucket:"{INFLUX_BUCKET}")
     m.fit(p)
 
     futuro=m.make_future_dataframe(
-      periods=12,
-      freq='5min'
+        periods=12,
+        freq="5min"
     )
 
-    prev=m.predict(futuro)
+    previsao=m.predict(futuro)
 
-    return{
-      "anomalia":bool(anomalia),
-      "temperatura":
-      float(df.iloc[-1]["temperatura"]),
-      "previsao":
-      round(
-      float(prev.iloc[-1]["yhat"]),2)
+    temp_futura=round(
+        float(
+            previsao.iloc[-1]["yhat"]
+        ),2
+    )
+
+    return {
+
+        "anomalia":bool(anomalia),
+
+        "temperatura_atual":
+        float(
+            df.iloc[-1]["temperatura"]
+        ),
+
+        "umidade_atual":
+        float(
+            df.iloc[-1]["umidade"]
+        ),
+
+        "previsao_1h":
+        temp_futura
     }
